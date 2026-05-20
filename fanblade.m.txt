@@ -1,0 +1,432 @@
+global k_T nmax mixer_mat N_thrusters thruster_config thruster_rotation_on
+% parameters
+installation_time = 100; 
+l1 = 35; l2 = 10; l3 = 5; 
+m = 70e3; r = 2; h = 100;
+I = (1/12) * m * (3*r^2 + h^2); 
+blade_overhang = 30; 
+nacelle_x = -20; nacelle_y = 30; nacelle_a = 90 * (pi/180);
+k_power = 1.25e-7;       
+battery_capacity_kWh = 4.16;
+ship_recharge_kW = 1900;  
+battery_current_kWh = battery_capacity_kWh; 
+% thruster layout
+% [x_local, y_local, initial_thrust_angle_rad]
+setup = 2;  
+thruster_rotation_on = true; 
+if setup == 1
+    cable_sway_on = true;
+    D = 2.8;
+    nmax = 1800;
+    arm = 7;
+    thruster_config = [
+         arm,   arm,  3*pi/4;
+        -arm,   arm,  pi/4;
+         arm,  -arm, -3*pi/4;
+        -arm,  -arm, -pi/4;
+    ];
+elseif setup == 2
+    cable_sway_on = false;
+    D = 2.8;
+    nmax = 1400;
+    arm = 7;
+    thruster_config = [
+         arm,   arm,  3*pi/4;
+        -arm,   arm,  pi/4;
+         arm,  -arm, -3*pi/4;
+        -arm,  -arm, -pi/4;
+    ];
+end
+Ct = 0.11; rho = 1.225;
+k_T = Ct * rho * D^4; 
+N_thrusters = size(thruster_config, 1);
+% allocation matrix setup
+if thruster_rotation_on
+    B_mat = zeros(3, 2*N_thrusters);
+    for i = 1:N_thrusters
+        tx = thruster_config(i, 1);
+        ty = thruster_config(i, 2);
+        B_mat(1, 2*i-1) = 1;      B_mat(1, 2*i) = 0;
+        B_mat(2, 2*i-1) = 0;      B_mat(2, 2*i) = 1;
+        B_mat(3, 2*i-1) = -ty;    B_mat(3, 2*i) = tx; 
+    end
+    mixer_mat = pinv(B_mat);
+else
+    alloc_mat = zeros(3, N_thrusters);
+    for i = 1:N_thrusters
+        tx = thruster_config(i, 1);
+        ty = thruster_config(i, 2);
+        t_ang = thruster_config(i, 3);
+        alloc_mat(1, i) = cos(t_ang);                   
+        alloc_mat(2, i) = sin(t_ang);                   
+        alloc_mat(3, i) = tx*sin(t_ang) - ty*cos(t_ang); 
+    end
+    mixer_mat = pinv(alloc_mat);
+end
+% nacelle stuff
+final_target_a = nacelle_a;
+final_target_x = nacelle_x + (l3 + blade_overhang) * sin(final_target_a);
+final_target_y = nacelle_y - (l3 + blade_overhang) * cos(final_target_a);
+% sim settings
+t = 0; stop = 50 + installation_time + 50; tscale = 10e-3; 
+% wind & cable stuff
+mean_F = 4000; mean_M = 200000;  
+gust_F = 8000; gust_M = 400000;  
+gust_duration = 3; 
+wind_base_dir = 45 * (pi/180); 
+wind_flicker_amp = 0.15; wind_dir_flicker = 30 * (pi/180);
+cable_length = 10; g = 9.81; 
+k_cable = (m * g) / cable_length; 
+sway_amp_x = 2.0; sway_amp_y = 2.0; 
+sway_period_x = 35; sway_period_y = 40; 
+% initial position
+start_x = final_target_x + 15; start_y = final_target_y - 0; start_a = final_target_a - 20 * (pi/180);
+x = start_x; y = start_y; a = start_a; 
+x_d = 0; y_d = 0; a_d = 0;
+n_rpm = zeros(N_thrusters, 1); 
+t_ang = thruster_config(:, 3); 
+% PID values
+Kp_xy = 1.2e4; Ki_xy = 500; Kd_xy = 5.5e4; 
+Kp_a = 5.0e6;  Ki_a = 5e4;  Kd_a = 4.0e7; 
+% fault injection settings
+fault_sensor_noise   = true;   
+noise_pos_std        = 0.02;            
+noise_vel_std        = 0.01;           
+noise_hdg_std        = 0.1 * (pi/180); 
+fault_sensor_dropout = false;   
+dropout_start        = 30;             
+dropout_duration     = 20;             
+fault_encoder_error  = true;   
+enc_err_offset       = (1:N_thrusters)' * (0.5 * pi/180); 
+fault_thruster_fail  = false;   
+fail_time            = 30;            
+failed_thruster_idx  = 1;              
+fault_latency        = true;   
+latency_steps        = 2;             
+% initialize memory
+last_meas = [start_x, start_y, start_a, 0, 0, 0];
+state_buffer = repmat(last_meas, latency_steps, 1);
+% plotting setup
+figure('Name', 'Propeller Control', 'Position', [100, 100, 1400, 850]);
+% main visuals
+subplot(4, 3, [1 2 4 5 7 8 10 11]); hold on; axis equal;
+window_size = 50; 
+xlim([final_target_x - window_size, final_target_x + window_size]);
+ylim([final_target_y - window_size, final_target_y + window_size]);
+title('Live Visuals'); xlabel('Global X (m)'); ylabel('Global Y (m)'); grid on;
+nac_w = 8; nac_l = 15;
+X_n_local = [-nac_w/2, nac_w/2, nac_w/2, -nac_w/2]; Y_n_local = [0, 0, nac_l, nac_l]; 
+X_n_glob = nacelle_x + X_n_local*cos(nacelle_a) - Y_n_local*sin(nacelle_a);
+Y_n_glob = nacelle_y + X_n_local*sin(nacelle_a) + Y_n_local*cos(nacelle_a);
+patch(X_n_glob, Y_n_glob, [0.4 0.4 0.4], 'DisplayName', 'Nacelle');
+plot(nacelle_x, nacelle_y, 'ro', 'MarkerSize', 6, 'MarkerFaceColor', 'r', 'DisplayName', 'Hub Target');
+hBlade = patch('XData', [], 'YData', [], 'FaceColor', [0.9 0.8 0.2], 'FaceAlpha', 0.5, 'DisplayName', 'Blade');
+uistack(hBlade, 'bottom'); 
+hCrane = plot(0, 0, 'b+', 'MarkerSize', 12, 'LineWidth', 2, 'DisplayName', 'Crane Tip');
+hCable = plot([0 0], [0 0], 'b-', 'LineWidth', 1.5, 'DisplayName', 'Lift Cable');
+% structure plots
+hBoomMain = plot(0, 0, 'k-', 'LineWidth', 8, 'DisplayName', 'Main Backbone'); 
+hArms = plot(0, 0, 'k-', 'LineWidth', 8, 'HandleVisibility', 'off'); 
+hCenter = plot(0, 0, 'ko', 'MarkerSize', 8, 'MarkerFaceColor', 'k', 'DisplayName', 'CoG'); 
+hHubs = plot(0, 0, 'ko', 'MarkerSize', 6, 'MarkerFaceColor', [0.5 0.5 0.5], 'HandleVisibility', 'off'); 
+colors = lines(max(3, N_thrusters));
+hM = gobjects(N_thrusters, 1);
+for i = 1:N_thrusters
+    hM(i) = quiver(0,0,0,0, 'Color', colors(i,:), 'LineWidth', 2, 'MaxHeadSize', 2, 'AutoScale', 'off', 'HandleVisibility', 'off');
+end
+hWind = quiver(0,0,0,0, 'r', 'LineWidth', 2, 'MaxHeadSize', 2, 'AutoScale', 'off', 'DisplayName', 'Local Wind Load');
+% angle error
+subplot(4, 3, 3);
+hLineAErr = animatedline('Color', 'b', 'LineWidth', 2, 'DisplayName', 'Angle Error');
+yline(0, 'k--', 'HandleVisibility','off'); title('Rotational Error (deg)'); grid on; legend('Location', 'best');
+% positional error
+subplot(4, 3, 6);
+hLineLat = animatedline('Color', 'r', 'LineWidth', 2, 'DisplayName', 'Y');
+hLineDep = animatedline('Color', 'b', 'LineWidth', 2, 'DisplayName', 'X');
+yline(0, 'k--', 'HandleVisibility','off'); title('Positional Error (m)'); grid on; legend('Location', 'best');
+% RPMs
+subplot(4, 3, 9);
+hN = gobjects(N_thrusters, 1);
+for i = 1:N_thrusters
+    hN(i) = animatedline('Color', colors(i,:), 'LineWidth', 1.5, 'DisplayName', sprintf('n%d', i));
+end
+yline(nmax, 'k--', 'HandleVisibility','off'); yline(-nmax, 'k--', 'HandleVisibility','off'); 
+title('Motor Speeds (RPM)'); grid on; legend('Location', 'best');
+% power and battery plot
+subplot(4, 3, 12);
+yyaxis left
+hLinePower = animatedline('Color', [0.8500 0.3250 0.0980], 'LineWidth', 1.5);
+ylabel('Inst. Power (kW)');
+yyaxis right
+hLineBattery = animatedline('Color', [0.4660 0.6740 0.1880], 'LineWidth', 2);
+ylabel('Battery (%)'); ylim([0 100]);
+title('Power Consump. & Battery'); grid on;
+arrow_scale = 5 / nmax; wind_scale = 15 / gust_F; 
+wind_noise_F = 0; wind_noise_dir = 0; sway_noise_x = 0; sway_noise_y = 0;
+while t <= stop
+    if t < 50, progress = 0; dp_dt = 0;
+    elseif t < 50 + installation_time 
+        p_raw = (t - 50) / installation_time;
+        progress = p_raw^2 * (3 - 2*p_raw); dp_dt = (6*p_raw - 6*p_raw^2) / installation_time; 
+    else progress = 1; dp_dt = 0; end
+    
+    current_target_x = start_x + progress * (final_target_x - start_x);
+    current_target_y = start_y + progress * (final_target_y - start_y);
+    
+    target_vx = dp_dt * (final_target_x - start_x);
+    target_vy = dp_dt * (final_target_y - start_y); target_va = 0;
+    
+    if cable_sway_on
+        sway_noise_x = 0.99 * sway_noise_x + 0.01 * (rand() - 0.5) * 2;
+        sway_noise_y = 0.99 * sway_noise_y + 0.01 * (rand() - 0.5) * 2;
+        
+        crane_x = current_target_x + (sway_amp_x + sway_noise_x) * sin((2*pi/sway_period_x) * t);
+        crane_y = current_target_y + (sway_amp_y + sway_noise_y) * sin((2*pi/sway_period_y) * t);
+        
+        Fc_x = k_cable * (crane_x - x); Fc_y = k_cable * (crane_y - y);
+    else
+        crane_x = current_target_x; crane_y = current_target_y;
+        Fc_x = 0; Fc_y = 0;
+    end
+    
+    if (t >= 15 && t < 15+gust_duration) || (t >= 30 && t < 30+gust_duration) || (t >= 45 && t < 45+gust_duration)
+        base_F = gust_F; base_M = gust_M;
+    else
+        base_F = mean_F; base_M = mean_M;
+    end
+    
+    wind_noise_F = 0.95 * wind_noise_F + 0.05 * (rand() - 0.5) * 2;
+    wind_noise_dir = 0.95 * wind_noise_dir + 0.05 * (rand() - 0.5) * 2;
+    
+    current_F_noisy = base_F * (1 + wind_noise_F * wind_flicker_amp);
+    current_M_noisy = base_M * (1 + wind_noise_F * wind_flicker_amp);
+    current_dir_noisy = wind_base_dir + wind_noise_dir * wind_dir_flicker;
+    
+    local_wind_x = cos(current_dir_noisy - a); local_wind_y = sin(current_dir_noisy - a);
+    F_local_x = current_F_noisy * local_wind_x; F_local_y = current_F_noisy * 0.2 * local_wind_y; 
+    
+    Wx = F_local_x * cos(a) - F_local_y * sin(a); Wy = F_local_x * sin(a) + F_local_y * cos(a);
+    Mw = current_M_noisy * local_wind_x;
+    
+    local_wind_x_est = cos(wind_base_dir - a); local_wind_y_est = sin(wind_base_dir - a);
+    F_local_x_est = mean_F * local_wind_x_est; F_local_y_est = mean_F * 0.2 * local_wind_y_est; 
+    Wx_est = F_local_x_est * cos(a) - F_local_y_est * sin(a);
+    Wy_est = F_local_x_est * sin(a) + F_local_y_est * cos(a); Mw_est = mean_M * local_wind_x_est;
+    
+    Wx_total = Wx + Fc_x; Wy_total = Wy + Fc_y;
+    
+    % sensor models
+    if fault_sensor_noise
+        meas_x  = x + randn * noise_pos_std;
+        meas_y  = y + randn * noise_pos_std;
+        meas_a  = a + randn * noise_hdg_std;
+        meas_xd = x_d + randn * noise_vel_std;
+        meas_yd = y_d + randn * noise_vel_std;
+        meas_ad = a_d + randn * noise_hdg_std;
+    else
+        meas_x = x; meas_y = y; meas_a = a;
+        meas_xd = x_d; meas_yd = y_d; meas_ad = a_d;
+    end
+    if fault_sensor_dropout && (t >= dropout_start && t <= dropout_start + dropout_duration)
+        meas_x = last_meas(1); meas_y = last_meas(2); meas_a = last_meas(3);
+        meas_xd = last_meas(4); meas_yd = last_meas(5); meas_ad = last_meas(6);
+    else
+        last_meas = [meas_x, meas_y, meas_a, meas_xd, meas_yd, meas_ad];
+    end
+    if fault_latency
+        state_buffer = [state_buffer(2:end, :); last_meas];
+        meas_x = state_buffer(1, 1); meas_y = state_buffer(1, 2); meas_a = state_buffer(1, 3);
+        meas_xd = state_buffer(1, 4); meas_yd = state_buffer(1, 5); meas_ad = state_buffer(1, 6);
+    end
+    if fault_encoder_error
+        perceived_t_ang = t_ang + enc_err_offset;
+    else
+        perceived_t_ang = t_ang;
+    end
+    % controller call 
+    [n_rpm_cmd, t_ang_cmd] = controller_mixer(meas_x, meas_y, meas_a, meas_xd, meas_yd, meas_ad, current_target_x, current_target_y, target_vx, target_vy, final_target_a, target_va, tscale, Kp_xy, Ki_xy, Kd_xy, Kp_a, Ki_a, Kd_a, Fc_x, Fc_y, Wx_est, Wy_est, Mw_est, perceived_t_ang, n_rpm);
+    % actuator models
+    if fault_encoder_error
+        t_ang = t_ang_cmd - enc_err_offset;
+    else
+        t_ang = t_ang_cmd;
+    end
+    n_rpm = n_rpm_cmd;
+    if fault_thruster_fail && t >= fail_time
+        n_rpm(failed_thruster_idx) = 0;
+    end
+    % physics engine
+    [Fx, Fy, Mnet] = calcphysics(a, n_rpm, t_ang, Wx_total, Wy_total, Mw);
+    
+    x_dd = Fx / m; y_dd = Fy / m; a_dd = Mnet / I;
+    
+    x_d = x_d + x_dd * tscale; y_d = y_d + y_dd * tscale; a_d = a_d + a_dd * tscale;
+    x = x + x_d * tscale; y = y + y_d * tscale; a = a + a_d * tscale;
+    t = t + tscale;
+    
+    instant_power_kW = sum(k_power * abs(n_rpm).^3);
+    net_power_kW = instant_power_kW - ship_recharge_kW;
+    
+    battery_current_kWh = battery_current_kWh - net_power_kW * (tscale / 3600);
+    battery_current_kWh = min(battery_capacity_kWh, max(0, battery_current_kWh));
+    battery_percent = (battery_current_kWh / battery_capacity_kWh) * 100;
+    
+    root_x = x - (l3 + blade_overhang) * sin(a); root_y = y + (l3 + blade_overhang) * cos(a);
+    err_x_glob = root_x - nacelle_x; err_y_glob = root_y - nacelle_y;
+    err_depth   = err_x_glob * (-sin(nacelle_a)) + err_y_glob * cos(nacelle_a);
+    err_lateral = err_x_glob * cos(nacelle_a)    + err_y_glob * sin(nacelle_a);
+    rot_err_rad = atan2(sin(a - nacelle_a), cos(a - nacelle_a));
+    
+    addpoints(hLineAErr, t, rot_err_rad * (180/pi)); 
+    addpoints(hLineLat, t, err_lateral); addpoints(hLineDep, t, err_depth);
+    for i = 1:N_thrusters
+        addpoints(hN(i), t, n_rpm(i)); 
+    end
+    addpoints(hLinePower, t, instant_power_kW);
+    addpoints(hLineBattery, t, battery_percent);
+    
+    if mod(t, 0.05) < tscale 
+        min_y = min([thruster_config(:, 2); -l1+l3-D/2]);
+        max_y = max([thruster_config(:, 2); l3]);
+        X_main = [0, 0]; Y_main = [max_y, min_y];
+        set(hBoomMain, 'XData', x + X_main*cos(a) - Y_main*sin(a), 'YData', y + X_main*sin(a) + Y_main*cos(a));
+        
+        X_arms = []; Y_arms = [];
+        for i = 1:N_thrusters
+            tx = thruster_config(i, 1); ty = thruster_config(i, 2);
+            if setup == 1 || setup == 2
+                X_arms = [X_arms, 0, tx, NaN];
+                Y_arms = [Y_arms, 0, ty, NaN];
+            end
+        end
+        if ~isempty(X_arms)
+            X_arms_glob = x + X_arms*cos(a) - Y_arms*sin(a);
+            Y_arms_glob = y + X_arms*sin(a) + Y_arms*cos(a);
+            set(hArms, 'XData', X_arms_glob, 'YData', Y_arms_glob);
+        else
+            set(hArms, 'XData', [], 'YData', []);
+        end
+        
+        set(hCenter, 'XData', x, 'YData', y);
+        
+        X_b_local = [-r, r, r, -r]; Y_b_local = [l3+blade_overhang, l3+blade_overhang, l3+blade_overhang-h, l3+blade_overhang-h];
+        set(hBlade, 'XData', x + X_b_local*cos(a) - Y_b_local*sin(a), 'YData', y + X_b_local*sin(a) + Y_b_local*cos(a));
+        set(hCrane, 'XData', crane_x, 'YData', crane_y);
+        set(hCable, 'XData', [crane_x, x], 'YData', [crane_y, y]);
+        
+        hub_x = zeros(N_thrusters, 1); hub_y = zeros(N_thrusters, 1);
+        for i = 1:N_thrusters
+            tx = thruster_config(i, 1); ty = thruster_config(i, 2); 
+            hub_x(i) = x + tx*cos(a) - ty*sin(a);
+            hub_y(i) = y + tx*sin(a) + ty*cos(a);
+            
+            glob_dir = a + t_ang(i);
+            u_vec = n_rpm(i) * arrow_scale * cos(glob_dir);
+            v_vec = n_rpm(i) * arrow_scale * sin(glob_dir);
+            
+            set(hM(i), 'XData', hub_x(i), 'YData', hub_y(i), 'UData', u_vec, 'VData', v_vec);
+        end
+        set(hHubs, 'XData', hub_x, 'YData', hub_y);
+        set(hWind, 'XData', x, 'YData', y, 'UData', Wx * wind_scale, 'VData', Wy * wind_scale);
+        
+        drawnow limitrate;
+    end
+end
+function [Fx, Fy, Mnet] = calcphysics(a, n_rpm, t_ang, Wx, Wy, Mw)
+    global k_T thruster_config N_thrusters
+    F_lx = 0; F_ly = 0; Mnet = Mw;
+    for i = 1:N_thrusters
+        T = sign(n_rpm(i)) * k_T * (n_rpm(i) / 60)^2;
+        tx = thruster_config(i, 1); ty = thruster_config(i, 2);
+        txi = T * cos(t_ang(i));
+        tyi = T * sin(t_ang(i));
+        F_lx = F_lx + txi;
+        F_ly = F_ly + tyi;
+        Mnet = Mnet + (tx * tyi - ty * txi);
+    end
+    Fx = F_lx * cos(a) - F_ly * sin(a) + Wx;
+    Fy = F_lx * sin(a) + F_ly * cos(a) + Wy;
+end
+function [n_rpm_out, t_ang_out] = controller_mixer(x, y, a, x_d, y_d, a_d, target_x, target_y, target_vx, target_vy, target_a, target_va, dt, Kp_xy, Ki_xy, Kd_xy, Kp_a, Ki_a, Kd_a, Fc_x, Fc_y, Wx_est, Wy_est, Mw_est, t_ang_current, n_rpm_current)
+    global k_T nmax mixer_mat N_thrusters thruster_rotation_on
+    persistent int_x int_y int_a
+    if isempty(int_x), int_x = 0; int_y = 0; int_a = 0; end
+    
+    ea = atan2(sin(target_a - a), cos(target_a - a));
+    ex = target_x - x;  ey = target_y - y;  
+    
+    max_int_xy = 30; max_int_a = 2.0;
+    int_x = max(-max_int_xy, min(max_int_xy, int_x + ex * dt));
+    int_y = max(-max_int_xy, min(max_int_xy, int_y + ey * dt));
+    int_a = max(-max_int_a,  min(max_int_a,  int_a + ea * dt));
+    
+    F_pid_x = Kp_xy * ex + Kd_xy * (target_vx - x_d) + Ki_xy * int_x;
+    F_pid_y = Kp_xy * ey + Kd_xy * (target_vy - y_d) + Ki_xy * int_y;
+    M_pid   = Kp_a  * ea + Kd_a  * (target_va - a_d) + Ki_a  * int_a;
+    
+    F_req_x = F_pid_x - Fc_x - Wx_est;
+    F_req_y = F_pid_y - Fc_y - Wy_est;
+    M_req   = M_pid - Mw_est;
+    
+    F_lx_req =  F_req_x * cos(a) + F_req_y * sin(a);
+    F_ly_req = -F_req_x * sin(a) + F_req_y * cos(a);
+    
+    req_vec = [F_lx_req; F_ly_req; M_req];
+    u = mixer_mat * req_vec; 
+    
+    T_max = k_T * (nmax / 60)^2;
+    n_rpm_out = zeros(N_thrusters, 1);
+    t_ang_out = zeros(N_thrusters, 1);
+    
+    if thruster_rotation_on
+        max_T_req = max(sqrt(u(1:2:end).^2 + u(2:2:end).^2));
+        if max_T_req > T_max
+            u = u * (T_max / max_T_req); 
+        end
+        
+        for i = 1:N_thrusters
+            Txi = u(2*i-1);
+            Tyi = u(2*i);
+            
+            T_mag = sqrt(Txi^2 + Tyi^2);
+            ang_target = atan2(Tyi, Txi);
+            
+            err = ang_target - t_ang_current(i);
+            err = mod(err + pi, 2*pi) - pi; 
+            
+            if abs(err) > pi/2
+                T_mag = -T_mag;
+                ang_target = ang_target + pi;
+                err = ang_target - t_ang_current(i);
+                err = mod(err + pi, 2*pi) - pi;
+            end
+            
+            max_rot_speed = 3.0; 
+            d_ang = max(-max_rot_speed*dt, min(max_rot_speed*dt, err));
+            t_ang_out(i) = t_ang_current(i) + d_ang;
+            
+            target_rpm = sign(T_mag) * sqrt(abs(T_mag) / k_T) * 60;
+            
+            max_rpm_rate = 5000; 
+            rpm_err = target_rpm - n_rpm_current(i);
+            d_rpm = max(-max_rpm_rate*dt, min(max_rpm_rate*dt, rpm_err));
+            n_rpm_out(i) = n_rpm_current(i) + d_rpm;
+        end
+    else
+        max_T_req = max(abs(u));
+        if max_T_req > T_max
+            u = u * (T_max / max_T_req); 
+        end
+        
+        for i = 1:N_thrusters
+            t_ang_out(i) = t_ang_current(i); 
+            
+            target_rpm = sign(u(i)) * sqrt(abs(u(i)) / k_T) * 60;
+            
+            max_rpm_rate = 5000; 
+            rpm_err = target_rpm - n_rpm_current(i);
+            d_rpm = max(-max_rpm_rate*dt, min(max_rpm_rate*dt, rpm_err));
+            n_rpm_out(i) = n_rpm_current(i) + d_rpm;
+        end
+    end
+end
